@@ -74,6 +74,18 @@ local function clamp(v, lo, hi)
     return v
 end
 
+-- Nothing but a finite number may reach the blitbuffer or a dirty region.
+--
+-- A NaN coordinate does not raise an error anywhere: clamp() passes it through
+-- (both comparisons are false), the paint loop decides no row is worth painting,
+-- and the function returns a region of NaN width -- which then goes into the
+-- refresh queue. Infinity is worse: it can turn a line into an unbounded loop.
+-- "v == v" is the cheapest NaN test there is.
+local function isFinite(v)
+    return type(v) == "number" and v == v
+        and v ~= math.huge and v ~= -math.huge
+end
+
 local function bbSize(bb)
     local ok, w, h = pcall(function() return bb:getWidth(), bb:getHeight() end)
     if ok and tonumber(w) and tonumber(h) then return w, h end
@@ -84,10 +96,15 @@ end
 -- nothing landed inside the buffer.
 function Canvas.stampDisc(bb, x, y, radius, color, ox, oy)
     if not bb then return nil end
+    ox, oy = ox or 0, oy or 0
+    if not (isFinite(x) and isFinite(y) and isFinite(radius)
+        and isFinite(ox) and isFinite(oy)) then
+        return nil
+    end
+
     local bw, bh = bbSize(bb)
     if not bw then return nil end
 
-    ox, oy = ox or 0, oy or 0
     x = clamp(math.floor(x + ox + 0.5), 0, bw - 1)
     y = clamp(math.floor(y + oy + 0.5), 0, bh - 1)
     radius = math.max(1, math.floor(radius + 0.5))
@@ -120,6 +137,10 @@ end
 
 function Canvas.drawLine(bb, x0, y0, x1, y1, radius, color, ox, oy)
     if not bb then return nil end
+    if not (isFinite(x0) and isFinite(y0) and isFinite(x1) and isFinite(y1)
+        and isFinite(radius)) then
+        return nil
+    end
 
     local dx, dy = x1 - x0, y1 - y0
     local dist = math.sqrt(dx * dx + dy * dy)
@@ -152,10 +173,13 @@ end
 -- ---------------------------------------------------------------------------
 -- Strokes
 -- ---------------------------------------------------------------------------
+-- Strokes are stored in native (portrait) space, so a `tf` is supplied to map
+-- each point into the current screen frame. A 90 degree rotation maps a
+-- straight line onto a straight line, so transforming the endpoints is exact.
 -- Eraser strokes are recorded only so an old sidecar file still loads; in the
 -- current model the strokes an eraser removed are already gone from the store,
 -- so there is nothing left to paint for them.
-function Canvas.renderStroke(bb, stroke, ox, oy)
+function Canvas.renderStroke(bb, stroke, ox, oy, tf)
     if not bb or not stroke or stroke.tool == "eraser" then return nil end
 
     local pts = stroke.points
@@ -164,10 +188,21 @@ function Canvas.renderStroke(bb, stroke, ox, oy)
     local color = Canvas.colorFor(stroke.color or Config.DEFAULT_COLOR)
     local radius = (stroke.width or Config.DEFAULT_WIDTH) / 2
 
-    local region = Canvas.stampDisc(bb, pts[1], pts[2], radius, color, ox, oy)
+    local function point(i)
+        local x, y = pts[i], pts[i + 1]
+        if tf then
+            local tx, ty = tf(x, y)
+            if tonumber(tx) and tonumber(ty) then x, y = tx, ty end
+        end
+        return x, y
+    end
+
+    local x0, y0 = point(1)
+    local region = Canvas.stampDisc(bb, x0, y0, radius, color, ox, oy)
+
     for i = 3, #pts - 1, 2 do
-        local line = Canvas.drawLine(bb, pts[i - 2], pts[i - 1], pts[i], pts[i + 1],
-            radius, color, ox, oy)
+        local x1, y1 = point(i)
+        local line = Canvas.drawLine(bb, x0, y0, x1, y1, radius, color, ox, oy)
         if line then
             if not region then
                 region = line
@@ -179,14 +214,15 @@ function Canvas.renderStroke(bb, stroke, ox, oy)
                 region = { x = x, y = y, w = x2 - x, h = y2 - y }
             end
         end
+        x0, y0 = x1, y1
     end
     return region
 end
 
-function Canvas.renderStrokes(bb, strokes, ox, oy)
+function Canvas.renderStrokes(bb, strokes, ox, oy, tf)
     if not bb or not strokes then return end
     for _, stroke in ipairs(strokes) do
-        Canvas.renderStroke(bb, stroke, ox, oy)
+        Canvas.renderStroke(bb, stroke, ox, oy, tf)
     end
 end
 

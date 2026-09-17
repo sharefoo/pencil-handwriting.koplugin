@@ -6,8 +6,24 @@ module exposed by another plugin sharing the global package.loaded table.
 --]]
 
 local _ = require("gettext")
+-- The colour names are shown in a menu, so they go through the plugin's own
+-- dictionary as well. Loading it must not be able to break the plugin: on any
+-- failure the plain gettext function is kept and the labels stay English.
+do
+    local ok, i18n = pcall(require, "pencilhw/i18n")
+    if ok and type(i18n) == "table" and type(i18n.gettext) == "function" then
+        _ = i18n.gettext
+    end
+end
 
 local Config = {}
+
+-- ============================================================================
+-- Version
+-- ============================================================================
+-- Single source of truth: main.lua and _meta.lua both read this, so the build
+-- reported in the diagnostics can never be a stale copy again.
+Config.VERSION = "0.9.9"
 
 -- ============================================================================
 -- Input device discovery
@@ -99,10 +115,12 @@ Config.COLOR_PALETTE = {
 -- event so a pen stroke can never be interpreted as a page-turn swipe.
 Config.INPUT_SOURCE = "auto"
 
--- Coordinates handed to the stylus callback are documented as "fully
--- processed", i.e. screen pixels. If a device hands over raw digitizer units
--- instead, "auto" notices the out-of-range values, opens the digitizer node
--- read-only to learn its axis ranges, and scales them into place.
+-- Coordinates handed to the stylus callback are raw digitizer values, which
+-- normally already are native (portrait) panel pixels -- the space strokes are
+-- stored in. If a device reports in its own units instead, "auto" notices the
+-- out-of-range values, opens the digitizer node read-only to learn its axis
+-- ranges, and scales them into place. The screen rotation is applied
+-- separately, at draw time, by pencilhw/geometry.
 Config.STYLUS_COORD_CORRECTION = "auto"     -- "auto" | "none"
 
 -- ============================================================================
@@ -159,6 +177,66 @@ Config.ERASE_REFRESH_MS          = 400
 -- ghosting the fast partial refreshes leave behind.
 Config.REFRESH_SETTLE_MS         = 600
 
+-- How long after a page change the page-identity accessors are re-read, to
+-- find out whether they track pages at all. Delayed on purpose: the document's
+-- own fields can still hold the old page at the instant the page-change event
+-- fires, so probing immediately would blame a healthy accessor.
+Config.KEY_AUDIT_DELAY_S         = 0.4
+
+-- ============================================================================
+-- Page identity
+-- ============================================================================
+-- A stroke is filed under a page identifier and the same identifier decides
+-- which strokes are painted. Deriving it two different ways in the write path
+-- and in the paint path is exactly what makes one stroke show up on two pages
+-- -- so main.lua keeps a single value (self.page_key), resolved in one place
+-- and updated the moment a page-change event arrives.
+--
+-- There is deliberately no menu switch for this. The document accessors were
+-- measured *lagging behind* the page turn on this build (crash.log: a page
+-- change to 40, and `ui.paging.current_page` still reporting 39 four tenths of
+-- a second later), and a lagging identity paints one page's strokes onto its
+-- neighbour -- so a switch was a way to break the plugin by accident. The
+-- identity is chosen automatically:
+--
+--   paged documents (PDF, DjVu, CBZ) -> the PageUpdate event page
+--   reflowable documents (EPUB, FB2) -> the accessor chain, xpointer first
+--
+-- The values are:
+--   "auto" -- as described above (the only supported setting)
+--   "live" -- source-level debug: always the accessor chain, even for paged
+--             documents. Expect ink on the neighbouring page; used only to
+--             compare what the accessors report against the event.
+-- Whatever is chosen, the diagnostics print the event page, the identity in
+-- use, and what every accessor returns.
+Config.PAGE_KEY_SOURCE           = "auto"
+
+-- Menu switch: force the panel clean-up on *every* page turn, not only the
+-- pages that have ink on them. Only useful as a test -- the diagnostics show
+-- whether it is on.
+Config.FULL_REFRESH_ON_PAGE_CHANGE = false
+
+-- What happens to the panel when a page has been written on and is then left.
+--
+-- Ink is drawn straight into the framebuffer, so it is not part of KOReader's
+-- page image. A page turn repaints the framebuffer correctly, but the *panel*
+-- is only given a non-flashing update, and that does not erase solid black ink:
+-- the strokes from the page you just left stay visible as a ghost on the next
+-- one. Text ghosts far less than a pen stroke, which is why only the ink
+-- follows you.
+--
+--   "on_ink" -- one flashing full refresh after a turn, only when the page
+--               being left has ink on it (default). Pages you have not written
+--               on keep KOReader's normal, fast, flash-free turn.
+--   "always" -- flash on every page turn
+--   "off"    -- never; KOReader's own refresh decision stands
+Config.PAGE_EXIT_CLEANUP = "on_ink"
+
+-- The refresh mode used for that clean-up. "full" flashes the whole screen,
+-- which is what actually removes the ghost; "flashui" and "ui" are gentler and
+-- may leave a trace of heavy ink.
+Config.PAGE_EXIT_REFRESH_MODE = "full"
+
 -- Guard for a long stroke drawn without ever lifting the pen: one real refresh
 -- every few seconds. Note that a refresh *includes* the strokes, it does not
 -- replace them, so this is only about ghosting, never about data loss.
@@ -170,7 +248,17 @@ Config.POLL_INTERVAL_S           = 0.008
 -- Persistence
 -- ============================================================================
 Config.SIDECAR_FILENAME          = "pencil_handwriting.lua"
-Config.STROKE_FORMAT_VERSION     = 1
+Config.STROKE_FORMAT_VERSION     = 2
+
+-- Stroke coordinates are stored in document *page* space (document pixels at
+-- scale 1, measured with the reader's own screenToPageTransform) so the ink
+-- stays attached to the content it was written on: scrolling, zooming or a page
+-- that only occupies part of the screen then cannot slide the handwriting over
+-- to another part of the page -- or over the neighbouring page.
+--
+-- Files written by version 1 are still read: their strokes are panel pixels and
+-- are tagged "native" on load, so they keep being drawn the old way.
+Config.STORE_IN_PAGE_SPACE       = true
 
 -- ============================================================================
 -- Helpers

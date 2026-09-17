@@ -9,7 +9,8 @@ Which node is opened is decided by capability, not by a hardcoded path:
 BTN_TOOL_PEN / BTN_TOOL_RUBBER wins. A name heuristic and finally a static
 path list are used only as fallbacks.
 
-Callback contract (coordinates already transformed into screen space):
+Callback contract (coordinates are native/portrait panel pixels, NOT screen
+pixels -- the screen rotation is applied at draw time by pencilhw/geometry):
 
     onPenDown(x, y, pressure)
     onPenMove(x, y, pressure)
@@ -22,6 +23,7 @@ Callback contract (coordinates already transformed into screen space):
 local ffi = require("ffi")
 local logger = require("logger")
 local Config = require("pencilhw/config")
+local Geometry = require("pencilhw/geometry")
 
 local C = ffi.C
 
@@ -173,59 +175,12 @@ local function deviceScore(d)
 end
 
 -- ---------------------------------------------------------------------------
--- Screen helpers (resolved lazily, never at plugin load time)
+-- Coordinate handling
 -- ---------------------------------------------------------------------------
-local function getScreen()
-    local ok, device = pcall(require, "device")
-    if not ok or not device or not device.screen then return nil end
-    return device.screen
-end
-
--- The framebuffer's own dimensions are authoritative: the canvas blits into
--- it 1:1, so everything must agree with the fb, not with a cached screen size.
-local function screenDims()
-    local screen = getScreen()
-    if not screen then return 600, 800 end
-    if screen.bb then
-        local ok, w, h = pcall(function()
-            return screen.bb:getWidth(), screen.bb:getHeight()
-        end)
-        if ok and tonumber(w) and tonumber(h) and w > 0 and h > 0 then
-            return w, h
-        end
-    end
-    return screen:getWidth(), screen:getHeight()
-end
-
-local ROTATION_NAMES = {
-    portrait = 0, landscape = 1,
-    portrait_inverted = 2, landscape_inverted = 3,
-    inverted_portrait = 2, inverted_landscape = 3,
-}
-
-local rotation_method
-local function getRotation()
-    if rotation_method == nil then
-        rotation_method = false
-        local screen = getScreen()
-        if screen then
-            for _, name in ipairs({ "getTouchRotation", "getRotation", "getRotationMode" }) do
-                if type(screen[name]) == "function" then
-                    rotation_method = name
-                    break
-                end
-            end
-        end
-    end
-    if not rotation_method then return 0 end
-
-    local screen = getScreen()
-    local ok, res = pcall(screen[rotation_method], screen)
-    if not ok then return 0 end
-    if type(res) == "number" then return res % 4 end
-    if type(res) == "string" then return ROTATION_NAMES[res:lower()] or 0 end
-    return 0
-end
+-- Rotation is deliberately *not* applied here. This module produces native
+-- (portrait panel) pixels, which is the space strokes are stored in; the
+-- screen rotation is applied at draw time by pencilhw/geometry.
+-- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
 -- EvdevReader
@@ -420,18 +375,25 @@ function EvdevReader:isOpen()
 end
 
 -- ---------------------------------------------------------------------------
--- Coordinate transform (raw digitizer space -> current screen space)
+-- Coordinate transform (raw digitizer units -> native panel pixels)
 -- ---------------------------------------------------------------------------
+-- Only the scaling is done here. The screen rotation is applied at draw time
+-- (see pencilhw/geometry), which keeps the stored strokes valid across a
+-- rotation instead of baking the current orientation into them.
+-- True when the node reported axis ranges that are usable for scaling.
+--
+-- This has to be checked before dividing by a span: several devices answer
+-- EVIOCGABS with a zero range (the Kindle Scribe's digitizer does), and a zero
+-- span turns scaled coordinates into infinities rather than raising an error.
+function EvdevReader:hasUsableRanges()
+    local rw = self.range_x_max - self.range_x_min
+    local rh = self.range_y_max - self.range_y_min
+    return rw > 0 and rh > 0
+end
+
 function EvdevReader:transform(x, y)
-    local w, h = screenDims()
-    local rot = getRotation()
+    local native_w, native_h = Geometry.nativeDims()
 
-    -- Native (unrotated) panel dimensions: after a 90/270 degree rotation the
-    -- framebuffer reports swapped width and height.
-    local native_w, native_h = w, h
-    if rot % 2 == 1 then native_w, native_h = h, w end
-
-    -- Raw units -> native pixels.
     local rw = self.range_x_max - self.range_x_min
     local rh = self.range_y_max - self.range_y_min
     if Config.AUTO_SCALE_RAW and rw > 0 and rh > 0 then
@@ -439,15 +401,6 @@ function EvdevReader:transform(x, y)
         y = (y - self.range_y_min) * native_h / rh
     end
 
-    if rot == 0 then          -- upright
-        return x, y
-    elseif rot == 1 then      -- clockwise
-        return w - y, x
-    elseif rot == 2 then      -- upside down
-        return w - x, h - y
-    elseif rot == 3 then      -- counter-clockwise
-        return y, h - x
-    end
     return x, y
 end
 
